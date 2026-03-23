@@ -139,6 +139,27 @@ async def setup_bittensor_objects(config: argparse.Namespace) -> Tuple[Any, Any,
     return wallet, subtensor, metagraph, miner_uid, epoch_length
 
 
+def _check_score_variance(scores: list, label: str) -> None:
+    """
+    Loggt Score-Varianz — wichtigster Indikator ob PSICHIC wirklich läuft.
+    Wenn alle Scores identisch → PSICHIC schlägt still fehl.
+    """
+    if not scores:
+        return
+    unique = len(set(round(float(s), 4) for s in scores))
+    mn, mx = min(float(s) for s in scores), max(float(s) for s in scores)
+    if unique == 1:
+        bt.logging.warning(
+            f"[PSICHIC WARNUNG] {label}: ALLE {len(scores)} Scores identisch = {mn:.4f}! "
+            f"PSICHIC schlägt still fehl — echte Scores würden variieren."
+        )
+    else:
+        bt.logging.debug(
+            f"[PSICHIC OK] {label}: {unique} einzigartige Scores, "
+            f"min={mn:.4f} max={mx:.4f} range={mx-mn:.4f}"
+        )
+
+
 async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
     """
     Continuously runs PSICHIC on batches from SAVI-2020.
@@ -146,6 +167,8 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
     Submits near epoch end.
     """
     bt.logging.info("Starting PSICHIC inference loop.")
+    state['batches_processed'] = 0
+
     dataset_iter = stream_random_chunk_from_dataset(
         dataset_repo=state['hugging_face_dataset_repo'],
         chunk_size=state['chunk_size']
@@ -166,6 +189,8 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 if df.empty:
                     continue
 
+                state['batches_processed'] = state.get('batches_processed', 0) + 1
+
                 # Score targets
                 target_scores = []
                 for protein in state['current_challenge_targets']:
@@ -175,7 +200,9 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                         scores = state['psichic_models'][protein].run_validation(
                             df['product_smiles'].tolist()
                         )
-                        target_scores.append(scores['predicted_binding_affinity'])
+                        raw = scores['predicted_binding_affinity']
+                        _check_score_variance(list(raw), f"target={protein} batch={state['batches_processed']}")
+                        target_scores.append(raw)
 
                 # Score antitargets
                 antitarget_scores = []
@@ -200,6 +227,17 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                     df['target_affinity'] - ANTITARGET_WEIGHT * df['antitarget_affinity']
                 )
 
+                # Antitarget Score-Varianz prüfen
+                for protein in state['current_challenge_antitargets']:
+                    if protein in state['psichic_models']:
+                        s = state['psichic_models'][protein].run_validation(
+                            df['product_smiles'].tolist()[:5]  # nur 5 zur Überprüfung
+                        )
+                        _check_score_variance(
+                            list(s['predicted_binding_affinity']),
+                            f"antitarget={protein} batch={state['batches_processed']}"
+                        )
+
                 # Merge with existing pool
                 pool = state['molecule_pool']
                 pool = pd.concat([pool, df], ignore_index=True)
@@ -207,9 +245,13 @@ async def run_psichic_model_loop(state: Dict[str, Any]) -> None:
                 pool = pool.drop_duplicates(subset=['product_smiles'])
                 state['molecule_pool'] = pool.head(POOL_SIZE).reset_index(drop=True)
 
-                bt.logging.debug(
-                    f"Pool: {len(state['molecule_pool'])} molecules, "
-                    f"best score: {state['molecule_pool']['combined_score'].iloc[0]:.4f}"
+                best = state['molecule_pool']['combined_score'].iloc[0] if len(state['molecule_pool']) > 0 else 0
+                bt.logging.info(
+                    f"[Pool] {len(state['molecule_pool'])} Moleküle | "
+                    f"Best={best:.4f} | "
+                    f"Batch={state['batches_processed']} | "
+                    f"Combined-Range: "
+                    f"{df['combined_score'].min():.4f}…{df['combined_score'].max():.4f}"
                 )
 
                 # Check if close to epoch end
